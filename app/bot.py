@@ -1,0 +1,555 @@
+#! /usr/bin/env python3
+## File: /handlers/bot.py
+
+"""
+Main Telegram bot class
+Orchestrates all bot functionality with proper lifecycle management.
+"""
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, List
+from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
+from telegram import Bot, Update, ChatMember
+from telegram.ext import Application, CommandHandler, ChatMemberHandler, ContextTypes
+from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError, TimedOut
+from telegram.request import HTTPXRequest
+import re
+
+from app.config import CONFIG
+from app.database.connection import SupabaseHandler
+from app.database.cache import CachedSupabaseHandler
+from app.database.realtime import RealtimeListener
+from app.handlers.commands import CommandHandlers
+from app.handlers.events import EventHandlers
+from app.handlers.bot_manager import GroupChatManager
+from app.service.notification import NotificationService
+from app.utils.log_settings import setup_logging
+from app.utils.helper import format_uptime
+
+logger = setup_logging('bot.log')
+
+class NPAMonitorBot:
+    """Main Telegram bot class with comprehensive functionality"""
+
+    def __init__(self):
+        # Clean the bot token to remove any newlines or whitespace
+        raw_token = CONFIG.telegram.bot_token
+        self.bot_token = raw_token.strip().replace('\n', '').replace('\r', '') if raw_token else None
+        
+        if not self.bot_token:
+            raise ValueError("Bot token is empty or invalid after cleaning")
+            
+        self.superadmin_ids = {str(id) for id in CONFIG.telegram.superadmin_ids}
+        # Monitor both new records tables supported by the data pipeline
+        self.monitoring_tables = ['depot_manager_new_records', 'approved_new_records']
+        self.application: Optional[Application] = None
+        self.bot: Optional[Bot] = None
+        self.db_handler: Optional[CachedSupabaseHandler] = None
+        self.realtime_listener: Optional[RealtimeListener] = None
+        self.group_manager = GroupChatManager()
+        self.notification_service: Optional[NotificationService] = None
+        self.command_handlers: Optional[CommandHandlers] = None
+        self.event_handlers: Optional[EventHandlers] = None
+        self.monitoring_active = False
+        self.last_notification_count = 0
+        self.monitoring_interval = CONFIG.monitoring.interval_seconds
+        self.start_time = int(datetime.now().timestamp())
+        self._background_tasks: set = set()
+        self.total_checks = 0
+        self.last_check_time = None
+        self._initialized = False
+    
+    async def initialise(self) -> None:
+        """Initialize all bot components with proper error handling"""
+        try:
+            logger.info("Initializing Monitoring Bot")
+            
+            # Create custom request with longer timeout
+            request = HTTPXRequest(
+                connection_pool_size=10,
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                write_timeout=30.0,
+                pool_timeout=30.0
+            )
+            
+            # Initialize application with custom request
+            self.application = Application.builder().token(self.bot_token).request(request).build()
+            
+            # Retry initialization with exponential backoff
+            await self._initialize_with_retry()
+            
+            # Initialize bot instance
+            self.bot = self.application.bot
+            
+            # Initialize database components
+            supabase_handler = SupabaseHandler()
+            self.db_handler = CachedSupabaseHandler(supabase_handler)
+            
+            # Initialize realtime listener
+            self.realtime_listener = RealtimeListener(self) 
+            await self.realtime_listener.initialize()
+            
+            # Initialize services
+            self.notification_service = NotificationService(
+                bot=self.bot,
+                group_manager=self.group_manager
+            )
+            
+            # Initialize handlers
+            self.command_handlers = CommandHandlers(self)
+            self.event_handlers = EventHandlers(self)
+            
+            # Setup Telegram handlers
+            self._setup_telegram_handlers()
+            
+            # Start background tasks
+            await self._start_background_tasks()
+            
+            # Verify initialization
+            await self._verify_initialization()
+            
+            self._initialized = True
+            logger.info("Bot initialization completed successfully")
+            
+        except Exception as e:
+            self._initialized = False
+            logger.error(f"Failed to initialize bot: {e}")
+            # Always try to notify superadmins safely
+            await self._notify_superadmins_safe(f"🚨 Bot initialization failed: {str(e)}")
+            raise
+    
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=4, max=60))
+    async def _initialize_with_retry(self) -> None:
+        """Initialize application with retry logic"""
+        try:
+            await self.application.initialize()
+            logger.info("Application initialized successfully")
+        except (TimedOut, TelegramError) as e:
+            logger.warning(f"Initialization timeout/error, retrying: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during initialization: {e}")
+            raise
+    
+    def _setup_telegram_handlers(self) -> None:
+        handlers = [
+            CommandHandler("start", self.command_handlers.start_command),
+            CommandHandler("help", self.command_handlers.help_command),
+            CommandHandler("status", self.command_handlers.status_command),
+            CommandHandler("subscribe", self.command_handlers.subscribe_command),
+            CommandHandler("unsubscribe", self.command_handlers.unsubscribe_command),
+            CommandHandler("check", self.command_handlers.check_command),
+            CommandHandler("recent", self.command_handlers.recent_command),
+            CommandHandler("stats", self.command_handlers.stats_command),
+            CommandHandler("volume", self.command_handlers.volume_command),
+            CommandHandler("download_pdf", self.command_handlers.download_pdf_command),
+            CommandHandler("groups", self.command_handlers.groups_command),
+            CommandHandler("cache_status", self.command_handlers.cache_status_command),
+            CommandHandler("clear_cache", self.command_handlers.clear_cache_command),
+        ]
+        for handler in handlers:
+            self.application.add_handler(handler)
+        self.application.add_handler(
+            ChatMemberHandler(self.event_handlers.track_chat_members, ChatMemberHandler.MY_CHAT_MEMBER)
+        )
+        logger.info(f"🔧 Registered {len(handlers) + 1} handlers to application")
+        logger.info(f"🔧 Application handlers count: {len(self.application.handlers.get(0, []))}")
+    
+    async def _start_background_tasks(self) -> None:
+        try:
+            await self._start_monitoring()
+            health_task = asyncio.create_task(self._health_check_loop())
+            self._background_tasks.add(health_task)
+            health_task.add_done_callback(self._background_tasks.discard)
+            cache_task = asyncio.create_task(self._cache_cleanup_loop())
+            self._background_tasks.add(cache_task)
+            cache_task.add_done_callback(self._background_tasks.discard)
+            # Add polling fallback task
+            polling_task = asyncio.create_task(self._polling_fallback_loop())
+            self._background_tasks.add(polling_task)
+            polling_task.add_done_callback(self._background_tasks.discard)
+        except Exception as e:
+            logger.error(f"Failed to start background tasks: {e}")
+            await self._notify_superadmins(f"🚨 Background tasks failed: {str(e)}")
+            raise
+    
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=30))
+    async def _start_monitoring(self) -> None:
+        try:
+            self.monitoring_active = True
+            logger.info(f"Real-time monitoring started for tables: {self.monitoring_tables}")
+        except Exception as e:
+            self.monitoring_active = False
+            logger.error(f"Failed to start monitoring: {e}")
+            await self._notify_superadmins(f"🚨 Real-time monitoring failed: {str(e)}")
+            raise
+    
+    async def _handle_new_record(self, table_name: str, record: dict) -> None:
+        try:
+            logger.info(f"New record detected in {table_name}: {record.get('id', 'unknown')}")
+            self.total_checks += 1
+            self.last_check_time = datetime.now()
+            
+            # Notify about new record
+            await self.notification_service.notify_new_records(table_name, record)
+            self.last_notification_count = 1
+                    
+        except Exception as e:
+            logger.error(f"Error handling new record from {table_name}: {e}")
+    
+    async def _health_check_loop(self) -> None:
+        attempt = 0
+        max_attempts = 5
+        while True:
+            try:
+                await asyncio.sleep(CONFIG.monitoring.buffer_timeout_seconds)
+                result, error = await self.db_handler.make_request('GET', '', params={'limit': '1'})
+                if error:
+                    logger.warning("Health check detected database issue")
+                    await self._notify_superadmins("⚠️ Database health check failed")
+                
+                # Check realtime connection health
+                if not self.realtime_listener.is_connected():
+                    logger.warning("Real-time monitoring is not connected")
+                    await self._notify_superadmins("⚠️ Real-time monitoring disconnected")
+                    attempt += 1
+                    if attempt > max_attempts:
+                        logger.error("Max reconnection attempts reached")
+                        break
+                    # Try to reconnect
+                    try:
+                        await self.realtime_listener.reconnect()
+                        logger.info("Successfully reconnected realtime listener")
+                        attempt = 0  # Reset on success
+                    except Exception as reconnect_error:
+                        logger.error(f"Failed to reconnect realtime listener: {reconnect_error}")
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    attempt = 0 
+                    if not await self.realtime_listener.health_check():
+                        logger.warning("Realtime listener failed health check")
+                        await self._notify_superadmins("⚠️ Realtime listener health check failed")
+            
+            except asyncio.CancelledError:
+                logger.info("Health check loop cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Health check error: {e}")
+                await asyncio.sleep(30)
+    
+    async def _cache_cleanup_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(CONFIG.monitoring.cache_ttl_seconds)
+                if not hasattr(self.db_handler, 'cache'):
+                    logger.warning("Cache not initialized for db_handler")
+                    continue
+                cleaned = self.db_handler.cache.cleanup_expired()
+                if cleaned > 0:
+                    logger.debug(f"Cleaned up {cleaned} expired cache entries")
+            except asyncio.CancelledError:
+                logger.info("Cache cleanup loop cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Cache cleanup error: {e}")
+    
+    async def _polling_fallback_loop(self) -> None:
+        """Poll for new records when realtime is disconnected"""
+        last_record_counts = {}
+        polling_interval = 30  # seconds
+        
+        while True:
+            try:
+                await asyncio.sleep(polling_interval)
+                
+                # Only poll if realtime is disconnected
+                if self.realtime_listener and self.realtime_listener.is_connected():
+                    continue
+                    
+                logger.info("Realtime disconnected, checking for new records via polling")
+                
+                # Get current record counts
+                current_counts = await self.db_handler.get_table_stats()
+                
+                for table_name in self.monitoring_tables:
+                    table_clean = table_name.strip()
+                    if not table_clean:
+                        continue
+                        
+                    current_count = current_counts.get(table_clean, 0)
+                    last_count = last_record_counts.get(table_clean, 0)
+                    
+                    if current_count > last_count:
+                        # New records detected
+                        new_records_count = current_count - last_count
+                        logger.info(f"Polling detected {new_records_count} new records in {table_clean}")
+                        
+                        # Get the actual new records
+                        try:
+                            recent_df = await self.db_handler.get_new_records(table_clean)
+                            if not recent_df.empty:
+                                # Process each new record
+                                for _, record in recent_df.head(new_records_count).iterrows():
+                                    await self._handle_new_record(table_clean, record.to_dict())
+                        except Exception as e:
+                            logger.error(f"Error processing polled records from {table_clean}: {e}")
+                    
+                    last_record_counts[table_clean] = current_count
+                
+            except asyncio.CancelledError:
+                logger.info("Polling fallback loop cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Polling fallback error: {e}")
+                await asyncio.sleep(60)  # Wait longer on error
+
+    async def run(self) -> None:
+        """Run the bot indefinitely"""
+        try:
+            logger.info("Starting NPA Monitor Bot")
+            if CONFIG.telegram.webhook_url:
+                logger.info("Webhook mode enabled, handled by serverless endpoint")
+                # For webhook mode, we need to start the application but not run polling
+                logger.info("Starting application for webhook processing...")
+                await self.application.start()
+                logger.info("✅ Application started for webhook mode")
+            else:
+                await self._run_polling()
+        except Exception as e:
+            logger.error(f"Error running bot: {e}")
+            await self._notify_superadmins(f"🚨 Bot error: {str(e)}")
+            raise
+    
+    async def _run_webhook(self) -> None:
+        try:
+            await self.bot.set_webhook(
+                url=f"{CONFIG.telegram.webhook_url}/webhook",
+                allowed_updates=Update.ALL_TYPES
+            )
+            await self.application.start()
+            await self.application.updater.start_webhook(
+                listen="0.0.0.0",
+                port=CONFIG.telegram.webhook_port,
+                url_path="/webhook",
+                webhook_url=f"{CONFIG.telegram.webhook_url}/webhook"
+            )
+
+            logger.info(f"Bot running with webhook on port {CONFIG.telegram.webhook_port}")
+        except Exception as e:
+            logger.error(f"Failed to start webhook: {e}")
+            raise
+    
+    async def _run_polling(self) -> None:
+        try:
+            logger.info("Starting bot in polling mode")
+            await self.application.start()
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            logger.info("Bot polling started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start polling: {e}")
+            raise
+
+    async def shutdown(self) -> None:
+        try:
+            logger.info("Starting bot shutdown")
+            self.monitoring_active = False
+            for task in self._background_tasks:
+                task.cancel()
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            if self.realtime_listener:
+                await self.realtime_listener.shutdown()
+            if self.db_handler:
+                await self.db_handler.close()
+            if self.application:
+                await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+            logger.info("Bot shutdown completed")
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+    async def _is_user_admin(self, chat_id: int, user_id: int) -> bool:
+        try:
+            chat_member = await self.bot.get_chat_member(chat_id, user_id)
+            return chat_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+        except TelegramError as e:
+            logger.warning(f"Telegram error checking admin status for user {user_id} in chat {chat_id}: {e}")
+            raise
+        except Exception as e:
+            logger.warning(f"Unexpected error checking admin status for user {user_id} in chat {chat_id}: {e}")
+            raise
+    
+    def _is_superadmin(self, user_id: int) -> bool:
+        return str(user_id) in self.superadmin_ids
+
+    async def _notify_superadmins(self, message: str) -> None:
+        """Notify superadmins with proper error handling and retry logic"""
+        if not self.bot:
+            logger.error("Cannot notify superadmins: bot not initialized")
+            return
+            
+        for admin_id in self.superadmin_ids:
+            max_retries = 3
+            retry_delay = 1
+            
+            for attempt in range(max_retries):
+                try:
+                    await self.bot.send_message(
+                        chat_id=int(admin_id),
+                        text=message,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    logger.info(f"Successfully notified superadmin {admin_id}")
+                    break  # Success, exit retry loop
+                    
+                except TelegramError as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Attempt {attempt + 1} failed for superadmin {admin_id}: {e}, retrying in {retry_delay}s")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        logger.error(f"All attempts failed for superadmin {admin_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error notifying superadmin {admin_id}: {e}")
+                    break  # Don't retry on unexpected errors
+                    
+            await asyncio.sleep(0.5)  # Small delay between admins
+
+    async def _notify_superadmins_safe(self, message: str) -> None:
+        """Safe wrapper for notifying superadmins that won't raise exceptions"""
+        try:
+            await self._notify_superadmins(message)
+        except Exception as e:
+            logger.error(f"Critical error in superadmin notification: {e}")
+
+    async def send_test_message(self, chat_id: int, message: str) -> bool:
+        try:
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return True
+        except TelegramError as e:
+            logger.warning(f"Failed to send test message to {chat_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error sending test message to {chat_id}: {e}")
+            return False
+    
+    def get_bot_stats(self) -> Dict:
+        uptime = datetime.now().timestamp() - self.start_time
+        stats = {
+            'uptime_seconds': int(uptime),
+            'uptime_formatted': format_uptime(self.start_time),
+            'monitoring_active': self.monitoring_active,
+            'total_checks': self.total_checks,
+            'last_check_time': self.last_check_time.isoformat() if self.last_check_time else None,
+            'last_notification_count': self.last_notification_count,
+            'subscribed_groups': len(self.group_manager.get_subscribed_groups()),
+            'background_tasks': len(self._background_tasks),
+            'start_time': datetime.fromtimestamp(self.start_time).isoformat(),
+            'realtime_connected': self.realtime_listener.is_connected() if self.realtime_listener else False
+        }
+        if hasattr(self.db_handler, 'cache'):
+            stats['cache'] = self.db_handler.get_cache_stats()
+        else:
+            stats['cache'] = {'error': 'Cache not initialized'}
+        stats['group_manager'] = self.group_manager.get_subscription_stats()
+        return stats
+    
+    async def perform_health_check(self) -> Dict[str, bool]:
+        health = {}
+        try:
+            result, error = await self.db_handler.make_request('GET', '', params={'limit': '1'})
+            health['database'] = error is None
+        except Exception as e:
+            logger.warning(f"Database health check failed: {e}")
+            health['database'] = False
+        try:
+            await self.bot.get_me()
+            health['telegram_api'] = True
+        except Exception as e:
+            logger.warning(f"Telegram API health check failed: {e}")
+            health['telegram_api'] = False
+        health['monitoring'] = self.realtime_listener.is_connected() if self.realtime_listener else False
+        health['background_tasks'] = len(self._background_tasks) > 0
+        health['overall'] = all(health.values())
+        return health
+    
+    def is_initialized(self) -> bool:
+        """Check if bot is fully initialized and ready"""
+        return self._initialized and self.bot is not None and self.db_handler is not None
+    
+    async def _verify_initialization(self) -> None:
+        """Verify all components are working after initialization"""
+        try:
+            # Test Telegram API first (most critical - this is the only critical component)
+            bot_info = await self.bot.get_me()
+            logger.info(f"Connected to Telegram bot: @{bot_info.username}")
+            
+            # Test database connection (non-critical for startup)
+            try:
+                result, error = await self.db_handler.make_request('GET', '', params={'limit': '1'})
+                if error:
+                    logger.warning(f"Database connection issue during startup: {error}")
+                    # Don't fail initialization, just log the warning
+                else:
+                    logger.info("Database connection verified successfully")
+            except Exception as db_error:
+                logger.warning(f"Database verification failed during startup: {db_error}")
+                # Continue with initialization - database issues shouldn't block bot startup
+            
+            # Test realtime connection (non-critical for startup)
+            try:
+                if not self.realtime_listener.is_connected():
+                    logger.warning("Realtime listener not connected during startup - will attempt reconnection in background")
+                else:
+                    logger.info("Realtime listener connected successfully")
+            except Exception as rt_error:
+                logger.warning(f"Realtime listener verification failed: {rt_error}")
+                # Continue with initialization despite realtime issues
+            
+            # Test notification service (basic check)
+            if not self.notification_service:
+                logger.warning("Notification service not initialized - some features may be unavailable")
+                # Don't raise exception, still allow bot to start
+            else:
+                logger.info("Notification service initialized successfully")
+            
+            # Mark as successfully initialized even with non-critical component issues
+            logger.info("All critical components verified successfully")
+        except Exception as e:
+            logger.error(f"Critical initialization verification failed: {e}")
+            raise
+    
+    # Public monitoring control methods
+    async def start_monitoring(self) -> bool:
+        """Start monitoring (public method)"""
+        try:
+            if not self.monitoring_active:
+                await self._start_monitoring()
+                return True
+            else:
+                logger.info("Monitoring is already active")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to start monitoring: {e}")
+            return False
+    
+    async def stop_monitoring(self) -> bool:
+        """Stop monitoring (public method)"""
+        try:
+            self.monitoring_active = False
+            logger.info("Monitoring stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to stop monitoring: {e}")
+            return False

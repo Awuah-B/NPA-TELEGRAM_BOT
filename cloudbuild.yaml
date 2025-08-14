@@ -1,0 +1,45 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA', '.']
+  
+  # Push the image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA']
+  
+  # Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'npa-monitor-bot'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '1'
+      - '--env-vars-file'
+      - 'env.yaml'
+      - '--max-instances'
+      - '10'
+      - '--concurrency'
+      - '1000'
+      - '--timeout'
+      - '3600'
+
+# Store the image in Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA'
+
+# Options for the build
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
