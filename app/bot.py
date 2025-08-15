@@ -202,6 +202,9 @@ class NPAMonitorBot:
     async def _health_check_loop(self) -> None:
         attempt = 0
         max_attempts = 5
+        health_check_failures = 0
+        max_health_failures = 3  # Only notify after multiple consecutive failures
+        
         while True:
             try:
                 await asyncio.sleep(CONFIG.monitoring.buffer_timeout_seconds)
@@ -213,24 +216,39 @@ class NPAMonitorBot:
                 # Check realtime connection health
                 if not self.realtime_listener.is_connected():
                     logger.warning("Real-time monitoring is not connected")
-                    await self._notify_superadmins("⚠️ Real-time monitoring disconnected")
                     attempt += 1
                     if attempt > max_attempts:
                         logger.error("Max reconnection attempts reached")
+                        await self._notify_superadmins("🚨 Real-time monitoring permanently disconnected")
                         break
                     # Try to reconnect
                     try:
                         await self.realtime_listener.reconnect()
                         logger.info("Successfully reconnected realtime listener")
                         attempt = 0  # Reset on success
+                        health_check_failures = 0  # Reset health check failures
                     except Exception as reconnect_error:
                         logger.error(f"Failed to reconnect realtime listener: {reconnect_error}")
                         await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 else:
                     attempt = 0 
-                    if not await self.realtime_listener.health_check():
-                        logger.warning("Realtime listener failed health check")
-                        await self._notify_superadmins("⚠️ Realtime listener health check failed")
+                    # Only check health if connected, and be less aggressive about failures
+                    try:
+                        health_ok = await self.realtime_listener.health_check()
+                        if not health_ok:
+                            health_check_failures += 1
+                            logger.debug(f"Realtime listener health check failed ({health_check_failures}/{max_health_failures})")
+                            
+                            # Only notify after multiple consecutive failures
+                            if health_check_failures >= max_health_failures:
+                                logger.warning(f"Realtime listener failed {health_check_failures} consecutive health checks")
+                                await self._notify_superadmins(f"⚠️ Realtime listener health check failed {health_check_failures} times")
+                                health_check_failures = 0  # Reset after notification
+                        else:
+                            health_check_failures = 0  # Reset on successful health check
+                    except Exception as health_error:
+                        logger.debug(f"Health check exception: {health_error}")
+                        health_check_failures += 1
             
             except asyncio.CancelledError:
                 logger.info("Health check loop cancelled")

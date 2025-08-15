@@ -35,11 +35,18 @@ class EventHandlers:
                 logger.info(f"Bot added to group {chat.id} ({chat.title or 'Unnamed Group'})")
                 await self.bot._notify_superadmins(f"🤖 Bot added to group: {chat.title or 'Unnamed Group'} (ID: {chat.id})")
             
-            elif new_status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
-                self.bot.group_manager.remove_group(str(chat.id))
-                logger.info(f"Bot removed from group {chat.id}")
-                await self.bot._notify_superadmins(f"🤖 Bot removed from group: {chat.title or 'Unnamed Group'} (ID: {chat.id})")
+            # Handle both old (KICKED) and new (BANNED) status values for compatibility
+            elif new_status in [ChatMemberStatus.LEFT, getattr(ChatMemberStatus, 'BANNED', None), getattr(ChatMemberStatus, 'KICKED', None)]:
+                # Filter out None values in case the attribute doesn't exist
+                if new_status is not None:
+                    self.bot.group_manager.remove_group(str(chat.id))
+                    logger.info(f"Bot removed from group {chat.id}")
+                    await self.bot._notify_superadmins(f"🤖 Bot removed from group: {chat.title or 'Unnamed Group'} (ID: {chat.id})")
         
+        except AttributeError as e:
+            logger.error(f"AttributeError in chat member update (likely ChatMemberStatus compatibility issue): {e}")
+            # Still try to notify but don't crash
+            await self.bot._notify_superadmins(f"⚠️ Chat member update error (status compatibility): {str(e)}")
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}")
             await self.bot._notify_superadmins(f"🚨 Error handling chat member update: {str(e)}")

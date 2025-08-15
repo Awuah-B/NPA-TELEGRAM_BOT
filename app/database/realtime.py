@@ -295,9 +295,22 @@ class RealtimeListener:
                     logger.debug("Health check failed: client missing required methods")
                     return False
                 
+                # Additional check: verify channels are still active
+                active_channels = 0
+                for table_name, channel in self.channels.items():
+                    if channel and hasattr(channel, 'state'):
+                        active_channels += 1
+                
+                if active_channels == 0:
+                    logger.debug("Health check failed: no active channel states")
+                    return False
+                
                 logger.debug(f"Health check passed: {len(self.channels)} active channels")
                 return True
                 
+            except AttributeError as e:
+                logger.debug(f"Health check failed during client attribute check: {e}")
+                return False
             except Exception as e:
                 logger.debug(f"Health check failed during client test: {e}")
                 return False
