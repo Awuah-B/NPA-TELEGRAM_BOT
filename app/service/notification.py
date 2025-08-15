@@ -6,6 +6,7 @@ Notification service for sending messages to subscribed groups
 Handles formatting and sending of new record notifications.
 """
 import asyncio
+from datetime import datetime
 from typing import Dict
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -28,14 +29,45 @@ class NotificationService:
     async def notify_new_records(self, table_name: str, record: Dict) -> None:
         """Notify subscribed groups about a new record"""
         try:
+            # Validate input parameters
+            if not table_name or not isinstance(table_name, str):
+                logger.error(f"Invalid table_name for notification: {table_name}")
+                return
+            
+            if not record or not isinstance(record, dict):
+                logger.error(f"Invalid record data for notification in {table_name}: {record}")
+                return
+            
+            # Validate record has some basic identifiable information
+            record_id = record.get('id', 'N/A')
+            if record_id == 'N/A':
+                logger.warning(f"Record missing ID field for {table_name}")
+            
             # Format notification message with the actual record data
-            message = format_notification_summary(table_name, record_data=record)
-            messages = split_message(message, max_length=4000)
+            try:
+                message = format_notification_summary(table_name, record_data=record)
+                if not message or not message.strip():
+                    logger.error(f"Empty message generated for {table_name} record {record_id}")
+                    return
+                    
+                messages = split_message(message, max_length=4000)
+                if not messages:
+                    logger.error(f"No messages generated after splitting for {table_name} record {record_id}")
+                    return
+                    
+            except Exception as format_error:
+                logger.error(f"Error formatting notification for {table_name} record {record_id}: {format_error}")
+                # Create a fallback simple message
+                messages = [f"🚨 New record detected in {table_name.replace('_', ' ').title()}\n"
+                           f"Record ID: {record_id}\n"
+                           f"Time: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n"
+                           f"Use /recent command for details."]
 
             # Get subscribed groups
             subscribed_groups = self.group_manager.get_subscribed_groups()
 
             # Send notification to each group
+            successful_notifications = 0
             for group_id in subscribed_groups:
                 try:
                     for msg in messages:
@@ -44,7 +76,8 @@ class NotificationService:
                             text=msg,
                             parse_mode=ParseMode.MARKDOWN
                         )
-                    logger.info(f"Sent notification to group {group_id} for new records in {table_name}")
+                    logger.info(f"Sent notification to group {group_id} for new record {record_id} in {table_name}")
+                    successful_notifications += 1
                     await asyncio.sleep(2)  # Rate limiting between groups
 
                 except TelegramError as e:
@@ -52,9 +85,12 @@ class NotificationService:
                 except Exception as e:
                     logger.error(f"Unexpected error sending notification to group {group_id}: {e}")
 
-            # Notify superadmin if no groups are subscribed
+            # Notify superadmin if no groups are subscribed or all notifications failed
             if not subscribed_groups:
-                logger.info(f"No subscribed groups found, notifying superadmins for {table_name}")
+                logger.info(f"No subscribed groups found, notifying superadmins for {table_name} record {record_id}")
+                await self._notify_superadmins_with_messages(messages, table_name)
+            elif successful_notifications == 0:
+                logger.warning(f"All group notifications failed for {table_name} record {record_id}, notifying superadmins")
                 await self._notify_superadmins_with_messages(messages, table_name)
 
         except Exception as e:

@@ -224,32 +224,66 @@ class RealtimeListener:
                 def create_callback(table_name: str) -> Callable:
                     def callback(payload: Dict[str, Any]) -> None:
                         try:
+                            # Validate payload structure first
+                            if not self._validate_payload(payload, table_name):
+                                return
+                            
                             logger.info(f"Received realtime INSERT event for {table_name}: {payload.get('eventType', 'unknown')}")
                             if payload.get('eventType') == 'INSERT':
                                 record = payload.get('new', {})
+                                
+                                # Additional validation for record data
+                                if not record or not isinstance(record, dict):
+                                    logger.warning(f"Invalid or empty record data for {table_name}: {record}")
+                                    return
+                                
                                 # Create task to handle the async callback with proper management
                                 task = asyncio.create_task(self.bot._handle_new_record(table_name, record))
                                 self._background_tasks.add(task)
                                 task.add_done_callback(self._background_tasks.discard)
                         except Exception as e:
                             logger.error(f"Error processing callback for {table_name}: {e}")
+                            # Try to notify about the error without causing more issues
+                            try:
+                                error_task = asyncio.create_task(
+                                    self.bot._notify_superadmins_safe(
+                                        f"🚨 Realtime callback error for {table_name}: {str(e)}"
+                                    )
+                                )
+                                self._background_tasks.add(error_task)
+                                error_task.add_done_callback(self._background_tasks.discard)
+                            except Exception as notify_error:
+                                logger.error(f"Failed to notify about callback error: {notify_error}")
                     return callback
                 
-                # Subscribe to Insert events only
-                channel.on_postgres_changes(
-                    event="INSERT",
-                    schema="public",
-                    table=table_name,
-                    callback=create_callback(table_name)
-                )
+                # Subscribe to Insert events only with enhanced error handling
+                try:
+                    channel.on_postgres_changes(
+                        event="INSERT",
+                        schema="public",
+                        table=table_name,
+                        callback=create_callback(table_name)
+                    )
 
-                # Subscribe to the channel
-                response = await channel.subscribe()
-                logger.info(f"Channel subscription response for {table_name}: {response}")
-                
-                # Store channel reference
-                self.channels[table_name] = channel
-                logger.info(f"Successfully subscribed to table: {table_name}")
+                    # Subscribe to the channel with timeout
+                    response = await asyncio.wait_for(channel.subscribe(), timeout=30.0)
+                    logger.info(f"Channel subscription response for {table_name}: {response}")
+                    
+                    # Validate subscription response
+                    if not self._validate_subscription_response(response, table_name):
+                        logger.warning(f"Subscription validation failed for {table_name}")
+                        continue
+                    
+                    # Store channel reference
+                    self.channels[table_name] = channel
+                    logger.info(f"Successfully subscribed to table: {table_name}")
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"Subscription timeout for table {table_name}")
+                    continue
+                except Exception as sub_error:
+                    logger.error(f"Failed to subscribe to table {table_name}: {sub_error}")
+                    continue
             
             except Exception as e:
                 logger.error(f"Failed to subscribe to table {table_name}: {e}", exc_info=True)
@@ -257,6 +291,79 @@ class RealtimeListener:
     def is_connected(self) -> bool:
         """Check if realtime client is connected"""
         return self.is_connected_flag and self.supabase is not None
+    
+    def _validate_payload(self, payload: Dict[str, Any], table_name: str) -> bool:
+        """Validate realtime payload structure and content"""
+        try:
+            # Check if payload exists and is a dictionary
+            if not payload or not isinstance(payload, dict):
+                logger.warning(f"Invalid payload structure for {table_name}: payload is not a dict")
+                return False
+            
+            # Check for required fields
+            event_type = payload.get('eventType')
+            if not event_type:
+                logger.warning(f"Missing eventType in payload for {table_name}: {payload}")
+                return False
+            
+            # For INSERT events, validate 'new' field exists
+            if event_type == 'INSERT':
+                new_record = payload.get('new')
+                if new_record is None:
+                    logger.warning(f"Missing 'new' field in INSERT payload for {table_name}: {payload}")
+                    return False
+                
+                if not isinstance(new_record, dict):
+                    logger.warning(f"Invalid 'new' field type in payload for {table_name}: {type(new_record)}")
+                    return False
+            
+            # Check for schema and table information
+            schema = payload.get('schema')
+            table = payload.get('table')
+            
+            if schema and schema != 'public':
+                logger.debug(f"Unexpected schema in payload for {table_name}: {schema}")
+            
+            if table and table != table_name:
+                logger.debug(f"Table mismatch in payload: expected {table_name}, got {table}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating payload for {table_name}: {e}")
+            return False
+    
+    def _validate_subscription_response(self, response: Any, table_name: str) -> bool:
+        """Validate subscription response from Supabase"""
+        try:
+            # Check if response indicates success
+            if response is None:
+                logger.warning(f"Null subscription response for {table_name}")
+                return False
+            
+            # If response is a string, check for error indicators
+            if isinstance(response, str):
+                error_indicators = ['error', 'failed', 'timeout', 'unable']
+                response_lower = response.lower()
+                for indicator in error_indicators:
+                    if indicator in response_lower:
+                        logger.warning(f"Error in subscription response for {table_name}: {response}")
+                        return False
+                return True
+            
+            # If response is a dict, check for error fields
+            if isinstance(response, dict):
+                if response.get('error') or response.get('status') == 'error':
+                    logger.warning(f"Error in subscription response for {table_name}: {response}")
+                    return False
+                return True
+            
+            # For other response types, assume success
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating subscription response for {table_name}: {e}")
+            return False
     
     async def reconnect(self) -> None:
         """Reconnect to Supabase realtime"""
@@ -336,12 +443,38 @@ class RealtimeListener:
                 await self._connect()
                 await self._subscribe_to_tables()
                 
-                logger.info("Background reconnection successful!")
-                return  # Exit the loop on successful reconnection
+                # Verify the connection worked
+                if self.is_connected() and self.channels:
+                    logger.info("Background reconnection successful!")
+                    # Notify superadmins about successful reconnection
+                    try:
+                        await self.bot._notify_superadmins_safe("✅ Realtime connection restored successfully")
+                    except Exception as notify_error:
+                        logger.warning(f"Failed to notify about successful reconnection: {notify_error}")
+                    return  # Exit the loop on successful reconnection
+                else:
+                    logger.warning("Background reconnection appeared successful but validation failed")
+                    current_attempt += 1
                 
             except Exception as e:
                 current_attempt += 1
                 logger.warning(f"Background reconnection attempt {current_attempt}/{max_attempts} failed: {e}")
                 
+                # Notify about persistent connection issues after several failed attempts
+                if current_attempt == 5:
+                    try:
+                        await self.bot._notify_superadmins_safe(
+                            f"⚠️ Realtime connection failing persistently (attempt {current_attempt}/{max_attempts})"
+                        )
+                    except Exception:
+                        pass  # Don't let notification errors block reconnection attempts
+                
         logger.error(f"All {max_attempts} background reconnection attempts failed")
+        # Final notification about complete failure
+        try:
+            await self.bot._notify_superadmins_safe(
+                f"🚨 Realtime connection permanently failed after {max_attempts} attempts. Manual intervention required."
+            )
+        except Exception:
+            pass
         # At this point, the bot will continue running without realtime

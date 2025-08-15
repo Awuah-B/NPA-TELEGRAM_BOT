@@ -188,16 +188,48 @@ class NPAMonitorBot:
     
     async def _handle_new_record(self, table_name: str, record: dict) -> None:
         try:
-            logger.info(f"New record detected in {table_name}: {record.get('id', 'unknown')}")
+            # Validate input parameters
+            if not table_name or not isinstance(table_name, str):
+                logger.error(f"Invalid table_name: {table_name}")
+                await self._notify_superadmins_safe("🚨 Invalid table name in realtime record")
+                return
+            
+            if not record or not isinstance(record, dict):
+                logger.error(f"Invalid record data for {table_name}: {record}")
+                await self._notify_superadmins_safe(f"🚨 Invalid record data for {table_name}")
+                return
+            
+            # Log with enhanced information
+            record_id = record.get('id', 'unknown')
+            logger.info(f"Processing new record {record_id} from {table_name}")
+            
             self.total_checks += 1
             self.last_check_time = datetime.now()
             
-            # Notify about new record
-            await self.notification_service.notify_new_records(table_name, record)
-            self.last_notification_count = 1
+            # Validate record has required fields for notifications
+            required_fields = ['id', 'created_at']
+            missing_fields = [field for field in required_fields if field not in record]
+            
+            if missing_fields:
+                logger.warning(f"Record missing required fields {missing_fields} for {table_name}: {record_id}")
+                # Still process the record but log the issue
+            
+            # Notify about new record with enhanced error handling
+            try:
+                await self.notification_service.notify_new_records(table_name, record)
+                self.last_notification_count = 1
+                logger.info(f"Successfully processed and notified new record {record_id} from {table_name}")
+            except Exception as notify_error:
+                logger.error(f"Failed to notify about new record {record_id} from {table_name}: {notify_error}")
+                # Try to notify superadmins about the notification failure
+                await self._notify_superadmins_safe(
+                    f"🚨 Notification failed for record {record_id} in {table_name}: {str(notify_error)}"
+                )
                     
         except Exception as e:
             logger.error(f"Error handling new record from {table_name}: {e}")
+            # Always try to notify superadmins about critical errors
+            await self._notify_superadmins_safe(f"🚨 Critical error processing record from {table_name}: {str(e)}")
     
     async def _health_check_loop(self) -> None:
         attempt = 0
