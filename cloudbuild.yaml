@@ -1,11 +1,11 @@
 steps:
   # Build the Docker image
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA', '.']
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$BUILD_ID', '.']
   
   # Push the image to Container Registry
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA']
+    args: ['push', 'gcr.io/$PROJECT_ID/npa-monitor-bot:$BUILD_ID']
   
   # Deploy to Cloud Run
   - name: 'gcr.io/cloud-builders/gcloud'
@@ -14,7 +14,7 @@ steps:
       - 'deploy'
       - 'npa-monitor-bot'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA'
+      - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$BUILD_ID'
       - '--region'
       - 'us-central1'
       - '--platform'
@@ -37,7 +37,7 @@ steps:
 
 # Store the image in Container Registry
 images:
-  - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/npa-monitor-bot:$BUILD_ID'
 
 # Options for the build
 options:

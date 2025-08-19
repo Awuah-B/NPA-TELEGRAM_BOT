@@ -239,7 +239,6 @@ class CommandHandlers:
                     f"💰 Price: {row.get('ex_ref_price', 'N/A')}\n"
                     f"📋 BRV: {row.get('brv_number', 'N/A')}\n"
                     f"🏢 BDC: {row.get('bdc', 'N/A')}\n"
-                    "─────────────────\n"
                 )
             messages = split_message(message)
 
@@ -412,26 +411,22 @@ class CommandHandlers:
     @subscribed_group_required
     async def download_pdf_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /download_pdf command with caching"""
-        chat = update.effective_chat 
+        chat = update.effective_chat
 
         if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
             await update.message.reply_text("❌ This command is only available in group chats.")
             return
-        
+
         try:
             async with asyncio.timeout(30):
-                # Create cache key based on current hour to cache PDFs for 30 minutes
                 current_time = datetime.now()
                 cache_key = f"pdf_{current_time.strftime('%Y%m%d_%H')}"
-                
-                # Check cache first
+
                 cached_result = self.pdf_cache.get(cache_key)
                 if cached_result:
                     pdf_data, filename = cached_result
                     logger.info(f"Serving cached PDF: {filename}")
-                    
                     await update.message.reply_text("📄 Generating report from cache...")
-                    
                     with BytesIO(pdf_data) as pdf_file:
                         pdf_file.name = filename
                         await update.message.reply_document(
@@ -440,35 +435,49 @@ class CommandHandlers:
                             caption=f"📄 Latest Report (📋 Cached - Generated at {filename.split('_')[1][:8]})"
                         )
                     return
-                
-                # Generate new PDF if not in cache
+
                 await update.message.reply_text("📄 Generating fresh PDF report...")
-                
-                fetch_result = await self.data_fetcher.fetch_data()
-                if fetch_result.error:
-                    await update.message.reply_text(f"❌ Failed to fetch data: {fetch_result.error}")
-                    return
-                
-                processed_df, error = await self.data_fetcher.process_data(fetch_result)
+
+                # First, try to get data from the database
+                processed_df = await self.db_handler.get_all_records_for_pdf()
+
+                # If database is empty, fall back to API
+                if processed_df.empty:
+                    logger.info("Database is empty, falling back to API for PDF generation.")
+                    await update.message.reply_text("ℹ️ Database is empty, falling back to API...")
+                    fetch_result = await self.data_fetcher.fetch_data()
+                    if fetch_result.error:
+                        await update.message.reply_text(f"❌ Failed to fetch data from API: {fetch_result.error}")
+                        return
+                    processed_df, error = await self.data_fetcher.process_data(fetch_result)
+                    if error:
+                        await update.message.reply_text(f"❌ Failed to process API data: {error}")
+                        return
 
                 if processed_df is None or processed_df.empty:
                     await update.message.reply_text("📭 No data found to generate PDF.")
                     return
-                
-                title = f"BOST-KUMASI Report - {current_time.strftime('%d-%m-%Y %H:%M:%S')}"
-                footnote = "Data sourced from NPA Enterprise API. Processed by I.T.S (Persol System Limited). Modified by Awuah."
 
-                pdf_data, error = await self.pdf_generator.generate(processed_df, title, footnote)
+                # Select main columns for the PDF report
+                main_columns = [
+                    'order_date', 'order_number', 'products', 'volume',
+                    'ex_ref_price', 'brv_number', 'bdc'
+                ]
+                pdf_df = processed_df[[col for col in main_columns if col in processed_df.columns]]
+
+                title = f"BOST-KUMASI Report - {current_time.strftime('%d-%m-%Y %H:%M:%S')}"
+                footnote = "Data sourced from Database. Processed by I.T.S (Persol System Limited). Modified by Awuah."
+
+                pdf_data, error = await self.pdf_generator.generate(pdf_df, title, footnote)
                 if error:
                     await update.message.reply_text(f"❌ Failed to generate PDF: {error}")
                     return
-                
+
                 filename = f"BOST-KUMASI_{current_time.strftime('%Y%m%d_%H%M%S')}.pdf"
-                
-                # Cache the generated PDF
+
                 self.pdf_cache.set(cache_key, pdf_data, filename)
                 logger.info(f"Cached new PDF: {filename}")
-                
+
                 with BytesIO(pdf_data) as pdf_file:
                     pdf_file.name = filename
                     await update.message.reply_document(
@@ -476,7 +485,7 @@ class CommandHandlers:
                         filename=filename,
                         caption=f"📄 Latest Report ({len(processed_df)} records) ✨ Fresh"
                     )
-        
+
         except asyncio.TimeoutError:
             logger.error("PDF generation timed out")
             await update.message.reply_text("❌ PDF generation timed out. Please try again later.")
@@ -527,6 +536,7 @@ I monitor the NPA system for updates and provide real-time notifications.
 • `/subscribe` - Subscribe group to notifications (admin only)
 • `/unsubscribe` - Unsubscribe group (admin only)
 • `/check <BRV>` - Search for specific BRV number
+• `/search_bdc <name>` - Search for records by BDC name
 • `/recent` - Show recent records
 • `/stats` - Show statistics
 • `/download_pdf` - Download latest report (subscribed groups only)
@@ -557,6 +567,7 @@ Please add me to a group chat and use the commands there.
 **Monitoring Commands:**
 • `/status` - Check if monitoring is active
 • `/check <BRV>` - Search for a specific BRV number
+• `/search_bdc <name>` - Search for records by BDC name
 • `/recent` - Show last 10 records
 • `/stats` - Show monitoring statistics
 • `/subscribe` - Subscribe group to notifications (admin only)
@@ -566,6 +577,7 @@ Please add me to a group chat and use the commands there.
 
 **Usage Examples:**
 • `/check AS496820` - Search for BRV number AS496820
+• `/search_bdc Reston` - Search for records from Reston BDC
 • `/recent` - Show recent records
 
 **Note:** Some commands require admin privileges or group subscription.
@@ -612,3 +624,67 @@ Please add me to a group chat and use the commands there.
 🗄️ **Database:** {db_status_text}
 💾 **Current Chat:** {'✅ Subscribed' if is_subscribed else '❌ Not Subscribed'}
         """
+    
+    @rate_limit(10)
+    async def search_bdc_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /search_bdc <bdc_name> - search records by BDC name (case-insensitive substring)
+
+        Queries all configured tables using SupabaseHandler.search_bdc and returns a summary
+        of the first matching records.
+        """
+        if not context.args:
+            await update.message.reply_text("❌ Please provide a BDC name to search. Usage: /search_bdc <BDC name>")
+            return
+
+        query = " ".join(context.args).strip()
+        if not query:
+            await update.message.reply_text("❌ Please provide a non-empty BDC name to search.")
+            return
+
+        await update.message.reply_text(f"🔎 Searching for records matching BDC: `{query}`...", parse_mode=ParseMode.MARKDOWN)
+
+        try:
+            results = await self.db_handler.search_bdc(query)
+
+            if not results:
+                await update.message.reply_text(f"📭 No records found matching BDC: `{query}`", parse_mode=ParseMode.MARKDOWN)
+                return
+
+            total = len(results)
+            max_show = 20
+            show_count = min(total, max_show)
+
+            message = f"✅ Found {total} record(s) matching BDC: `{query}`\nShowing first {show_count}:\n\n"
+
+            for idx, item in enumerate(results[:show_count], start=1):
+                row = item.get('data', {})
+                table_name = item.get('table', 'unknown').replace('_', ' ').title()
+
+                created_at = row.get('created_at', 'N/A')
+                if created_at and created_at != 'N/A':
+                    try:
+                        created_at = pd.to_datetime(created_at).strftime('%d-%m-%Y %H:%M:%S')
+                    except Exception:
+                        created_at = str(created_at)
+
+                message += (
+                    f"**{idx}. Table:** {table_name}\n"
+                    f"• ID: {row.get('id', 'N/A')}\n"
+                    f"• Order: {row.get('order_number', 'N/A')}\n"
+                    f"• BDC: {row.get('bdc', 'N/A')}\n"
+                    f"• BRV: {row.get('brv_number', 'N/A')}\n"
+                    f"• Volume: {row.get('volume', 'N/A')}\n"
+                    f"• Detected: {created_at}\n"
+                    "─────────────────\n"
+                )
+
+            if total > max_show:
+                message += f"\nℹ️ {total - max_show} more results not shown. Run the command in a private chat or request an export to retrieve full results."
+
+            messages = split_message(message)
+            for msg in messages:
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+        except Exception as e:
+            logger.error(f"search_bdc command failed for '{query}': {e}")
+            await update.message.reply_text(f"❌ Search failed: {str(e)}")

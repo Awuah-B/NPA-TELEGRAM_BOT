@@ -65,6 +65,12 @@ class GroupChatManager:
         self.group_admins = {}
         self.group_metadata = {}
 
+    def refresh_subscriptions(self) -> None:
+        """Refresh subscriptions from storage file"""
+        logger.info("Refreshing subscriptions from storage")
+        self._load_subscriptions()
+        stats = self.get_subscription_stats()
+        logger.info(f"Refreshed: {stats['total_subscribed_groups']} groups, {stats['total_group_admins']} admins")
     
     def _backup_corrupted_file(self) -> None:
         """Backup corrupted subscription file"""

@@ -224,23 +224,30 @@ class RealtimeListener:
                 def create_callback(table_name: str) -> Callable:
                     def callback(payload: Dict[str, Any]) -> None:
                         try:
-                            # Validate payload structure first
-                            if not self._validate_payload(payload, table_name):
+                            logger.info(f"Received payload for {table_name}: {payload}")
+                            logger.info(f"Received payload for {table_name}: {payload}")
+                            # Enhanced payload validation
+                            if not isinstance(payload, dict):
+                                logger.warning(f"Payload is not a dictionary for {table_name}: {type(payload)}")
+                                return
+
+                            event_type = payload.get('type')
+                            if event_type != 'INSERT':
+                                logger.debug(f"Ignoring non-INSERT event type: {event_type} for {table_name}")
+                                return
+
+                            record = payload.get('record')
+                            if not record or not isinstance(record, dict):
+                                logger.warning(f"Missing or invalid 'record' in INSERT payload for {table_name}: {payload}")
                                 return
                             
-                            logger.info(f"Received realtime INSERT event for {table_name}: {payload.get('eventType', 'unknown')}")
-                            if payload.get('eventType') == 'INSERT':
-                                record = payload.get('new', {})
-                                
-                                # Additional validation for record data
-                                if not record or not isinstance(record, dict):
-                                    logger.warning(f"Invalid or empty record data for {table_name}: {record}")
-                                    return
-                                
-                                # Create task to handle the async callback with proper management
-                                task = asyncio.create_task(self.bot._handle_new_record(table_name, record))
-                                self._background_tasks.add(task)
-                                task.add_done_callback(self._background_tasks.discard)
+                            logger.info(f"Received realtime INSERT event for {table_name}")
+                            
+                            # Create task to handle the async callback with proper management
+                            task = asyncio.create_task(self.bot._handle_new_record(table_name, record))
+                            self._background_tasks.add(task)
+                            task.add_done_callback(self._background_tasks.discard)
+                            
                         except Exception as e:
                             logger.error(f"Error processing callback for {table_name}: {e}")
                             # Try to notify about the error without causing more issues
@@ -292,46 +299,7 @@ class RealtimeListener:
         """Check if realtime client is connected"""
         return self.is_connected_flag and self.supabase is not None
     
-    def _validate_payload(self, payload: Dict[str, Any], table_name: str) -> bool:
-        """Validate realtime payload structure and content"""
-        try:
-            # Check if payload exists and is a dictionary
-            if not payload or not isinstance(payload, dict):
-                logger.warning(f"Invalid payload structure for {table_name}: payload is not a dict")
-                return False
-            
-            # Check for required fields
-            event_type = payload.get('eventType')
-            if not event_type:
-                logger.warning(f"Missing eventType in payload for {table_name}: {payload}")
-                return False
-            
-            # For INSERT events, validate 'new' field exists
-            if event_type == 'INSERT':
-                new_record = payload.get('new')
-                if new_record is None:
-                    logger.warning(f"Missing 'new' field in INSERT payload for {table_name}: {payload}")
-                    return False
-                
-                if not isinstance(new_record, dict):
-                    logger.warning(f"Invalid 'new' field type in payload for {table_name}: {type(new_record)}")
-                    return False
-            
-            # Check for schema and table information
-            schema = payload.get('schema')
-            table = payload.get('table')
-            
-            if schema and schema != 'public':
-                logger.debug(f"Unexpected schema in payload for {table_name}: {schema}")
-            
-            if table and table != table_name:
-                logger.debug(f"Table mismatch in payload: expected {table_name}, got {table}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error validating payload for {table_name}: {e}")
-            return False
+    
     
     def _validate_subscription_response(self, response: Any, table_name: str) -> bool:
         """Validate subscription response from Supabase"""

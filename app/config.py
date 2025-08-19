@@ -67,6 +67,8 @@ class MonitoringConfig:
     pipeline_cleanup_time: str = os.getenv('PIPELINE_TABLE_CLEANUP_TIME', '23:00')
     # Pipeline run interval - should match data pipeline interval
     pipeline_interval: int = int(os.getenv('PIPELINE_INTERVAL', '120'))
+    polling_enabled: bool = field(default=False)
+    polling_interval_seconds: int = field(default=300)
 
 class Config:
     """Main configuration class"""
@@ -117,7 +119,9 @@ class Config:
                 max_notification_records=int(os.getenv('MAX_NOTIFICATION_RECORDS', '5')),
                 max_retries=int(os.getenv('MAX_RETRIES', '3')),
                 log_level=os.getenv('LOG_LEVEL', 'INFO'),
-                tables=os.getenv('MONITORING_TABLES', 'approved,brv_checked,good_standing,loaded,order_released,ordered,ppmc_cancel_order,marked,depot_manager,depot_manager_new_records,approved_new_records').split(',')
+                tables=os.getenv('MONITORING_TABLES', 'approved,brv_checked,good_standing,loaded,order_released,ordered,ppmc_cancel_order,marked,depot_manager,depot_manager_new_records,approved_new_records').split(','),
+                polling_enabled=os.getenv('POLLING_ENABLED', 'False').lower() == 'true',
+                polling_interval_seconds=int(os.getenv('POLLING_INTERVAL_SECONDS', '300'))
             )
             
             self._validate_config()

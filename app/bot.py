@@ -59,6 +59,7 @@ class NPAMonitorBot:
         self.total_checks = 0
         self.last_check_time = None
         self._initialized = False
+        self.last_polled_timestamp: Dict[str, datetime] = {}
     
     async def initialise(self) -> None:
         """Initialize all bot components with proper error handling"""
@@ -104,6 +105,9 @@ class NPAMonitorBot:
             # Setup Telegram handlers
             self._setup_telegram_handlers()
             
+            # Load and verify subscribed groups
+            await self._load_and_verify_groups()
+            
             # Start background tasks
             await self._start_background_tasks()
             
@@ -141,6 +145,7 @@ class NPAMonitorBot:
             CommandHandler("subscribe", self.command_handlers.subscribe_command),
             CommandHandler("unsubscribe", self.command_handlers.unsubscribe_command),
             CommandHandler("check", self.command_handlers.check_command),
+            CommandHandler("search_bdc", self.command_handlers.search_bdc_command),
             CommandHandler("recent", self.command_handlers.recent_command),
             CommandHandler("stats", self.command_handlers.stats_command),
             CommandHandler("volume", self.command_handlers.volume_command),
@@ -148,6 +153,7 @@ class NPAMonitorBot:
             CommandHandler("groups", self.command_handlers.groups_command),
             CommandHandler("cache_status", self.command_handlers.cache_status_command),
             CommandHandler("clear_cache", self.command_handlers.clear_cache_command),
+            CommandHandler("search_bdc", self.command_handlers.search_bdc_command)
         ]
         for handler in handlers:
             self.application.add_handler(handler)
@@ -156,6 +162,61 @@ class NPAMonitorBot:
         )
         logger.info(f"🔧 Registered {len(handlers) + 1} handlers to application")
         logger.info(f"🔧 Application handlers count: {len(self.application.handlers.get(0, []))}")
+    
+    async def _load_and_verify_groups(self) -> None:
+        """Load and verify subscribed groups during initialization"""
+        try:
+            # Force refresh subscriptions to ensure they're current
+            self.group_manager.refresh_subscriptions()
+            
+            # Get current subscription stats
+            stats = self.group_manager.get_subscription_stats()
+            subscribed_groups = self.group_manager.get_subscribed_groups()
+            
+            logger.info(f"📋 Loaded subscription data:")
+            logger.info(f"  - Total subscribed groups: {stats['total_subscribed_groups']}")
+            logger.info(f"  - Total group admins: {stats['total_group_admins']}")
+            logger.info(f"  - Storage file exists: {stats['storage_exists']}")
+            logger.info(f"  - Storage file path: {stats['storage_file']}")
+            
+            if subscribed_groups:
+                logger.info(f"📢 Active subscribed groups:")
+                accessible_groups = []
+                inaccessible_groups = []
+                
+                for group_id in subscribed_groups:
+                    admins = self.group_manager.get_group_admins(group_id)
+                    logger.info(f"  - Group {group_id}: {len(admins)} admin(s)")
+                    
+                    # Try to verify bot has access to the group
+                    try:
+                        if self.bot:
+                            chat = await self.bot.get_chat(group_id)
+                            accessible_groups.append(group_id)
+                            logger.info(f"  ✅ Bot has access to group {group_id} ({chat.title if hasattr(chat, 'title') else 'Unknown'})")
+                    except Exception as e:
+                        inaccessible_groups.append(group_id)
+                        logger.warning(f"  ❌ Bot cannot access group {group_id}: {e}")
+                
+                # Prepare notification message
+                accessible_list = "\n".join([f"✅ {group_id}" for group_id in accessible_groups])
+                inaccessible_list = "\n".join([f"❌ {group_id}" for group_id in inaccessible_groups])
+                
+                message_parts = [f"🔄 Bot initialized with {len(subscribed_groups)} subscribed group(s):"]
+                if accessible_list:
+                    message_parts.append(f"\nAccessible groups:\n{accessible_list}")
+                if inaccessible_list:
+                    message_parts.append(f"\nInaccessible groups:\n{inaccessible_list}")
+                
+                #await self._notify_superadmins_safe("\n".join(message_parts))
+                    
+            else:
+                logger.info("📢 No subscribed groups found")
+                await self._notify_superadmins_safe("🔄 Bot initialized with no subscribed groups")
+                
+        except Exception as e:
+            logger.error(f"Failed to load and verify groups: {e}")
+            await self._notify_superadmins_safe(f"⚠️ Failed to load subscribed groups: {str(e)}")
     
     async def _start_background_tasks(self) -> None:
         try:
@@ -306,47 +367,41 @@ class NPAMonitorBot:
                 logger.error(f"Cache cleanup error: {e}")
     
     async def _polling_fallback_loop(self) -> None:
-        """Poll for new records when realtime is disconnected"""
-        last_record_counts = {}
-        polling_interval = 30  # seconds
+        """Poll for new records when realtime is disconnected or polling is enabled"""
+        polling_interval = CONFIG.monitoring.polling_interval_seconds
         
         while True:
             try:
                 await asyncio.sleep(polling_interval)
                 
-                # Only poll if realtime is disconnected
-                if self.realtime_listener and self.realtime_listener.is_connected():
+                # Only poll if polling is enabled or realtime is disconnected
+                if not CONFIG.monitoring.polling_enabled and \
+                   (self.realtime_listener and self.realtime_listener.is_connected()):
                     continue
                     
-                logger.info("Realtime disconnected, checking for new records via polling")
-                
-                # Get current record counts
-                current_counts = await self.db_handler.get_table_stats()
+                if CONFIG.monitoring.polling_enabled:
+                    logger.info("Polling enabled, checking for new records")
+                else:
+                    logger.info("Realtime disconnected, checking for new records via polling")
                 
                 for table_name in self.monitoring_tables:
-                    table_clean = table_name.strip()
-                    if not table_clean:
-                        continue
-                        
-                    current_count = current_counts.get(table_clean, 0)
-                    last_count = last_record_counts.get(table_clean, 0)
+                    last_checked = self.last_polled_timestamp.get(table_name, datetime.min)
+                    new_records_df = await self.db_handler.get_new_records_since(table_name, last_checked)
                     
-                    if current_count > last_count:
-                        # New records detected
-                        new_records_count = current_count - last_count
-                        logger.info(f"Polling detected {new_records_count} new records in {table_clean}")
-                        
-                        # Get the actual new records
-                        try:
-                            recent_df = await self.db_handler.get_new_records(table_clean)
-                            if not recent_df.empty:
-                                # Process each new record
-                                for _, record in recent_df.head(new_records_count).iterrows():
-                                    await self._handle_new_record(table_clean, record.to_dict())
-                        except Exception as e:
-                            logger.error(f"Error processing polled records from {table_clean}: {e}")
-                    
-                    last_record_counts[table_clean] = current_count
+                    if not new_records_df.empty:
+                        logger.info(f"Polling detected {len(new_records_df)} new records in {table_name}")
+                        for _, record in new_records_df.iterrows():
+                            await self._handle_new_record(table_name, record.to_dict())
+                        # Update last_polled_timestamp for this table to the latest record's created_at
+                        latest_created_at = new_records_df['created_at'].max()
+                        if pd.notna(latest_created_at):
+                            # Ensure it's a datetime object
+                            if isinstance(latest_created_at, pd.Timestamp):
+                                self.last_polled_timestamp[table_name] = latest_created_at.to_pydatetime()
+                            else:
+                                self.last_polled_timestamp[table_name] = datetime.fromisoformat(latest_created_at)
+                    else:
+                        logger.debug(f"No new records in {table_name} since {last_checked}")
                 
             except asyncio.CancelledError:
                 logger.info("Polling fallback loop cancelled")

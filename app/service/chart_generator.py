@@ -165,7 +165,7 @@ class ChartGenerator:
         # Customize the chart
         ax.set_xlabel('BDC', fontsize=12, color=self.text_color, fontweight='bold')
         ax.set_ylabel('Volume', fontsize=12, color=self.text_color, fontweight='bold')
-        ax.set_title('Volume Distribution by BDC', fontsize=14, color=self.text_color, fontweight='bold', pad=20)
+        ax.set_title('Volume Distribution by BDC (All orders)', fontsize=14, color=self.text_color, fontweight='bold', pad=20)
         
         # Set x-axis labels
         ax.set_xticks(range(len(bdcs)))
@@ -234,3 +234,105 @@ class ChartGenerator:
     def is_available() -> bool:
         """Check if chart generation is available"""
         return MATPLOTLIB_AVAILABLE
+    
+    def generate_product_pie_chart_from_counts(self, product_counts: Dict[str, int]) -> Optional[bytes]:
+        """Generate a pie chart showing product distribution (PMS, AGO, Others) from counts dict.
+
+        product_counts: mapping of product name -> count
+        Returns PNG bytes or None on failure.
+        """
+        if not MATPLOTLIB_AVAILABLE:
+            logger.warning("Matplotlib not available - cannot generate product pie chart")
+            return None
+
+        try:
+            # Normalize keys (uppercase) and aggregate
+            counts = {}
+            for k, v in (product_counts or {}).items():
+                key = (k or 'Unknown').strip().upper()
+                counts[key] = counts.get(key, 0) + int(v)
+
+            # Focus on PMS and AGO; everything else to 'Others'
+            pms = counts.get('PMS', 0)
+            ago = counts.get('AGO', 0)
+            other_total = sum(v for k, v in counts.items() if k not in ('PMS', 'AGO'))
+
+            labels = []
+            sizes = []
+            if pms > 0:
+                labels.append('PMS')
+                sizes.append(pms)
+            if ago > 0:
+                labels.append('AGO')
+                sizes.append(ago)
+            if other_total > 0:
+                labels.append('Others')
+                sizes.append(other_total)
+
+            if not sizes:
+                logger.warning("No product counts to plot for product pie chart")
+                return None
+
+            # Plot pie chart
+            plt.style.use('default')
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=self.dpi)
+            colors = ['#ff9999', '#66b3ff', '#99ff99']
+            wedges, texts, autotexts = ax.pie(
+                sizes,
+                labels=labels,
+                autopct='%1.1f%%',
+                startangle=140,
+                colors=colors[:len(sizes)],
+                textprops={'color': self.text_color}
+            )
+
+            ax.axis('equal')  # Equal aspect ensures that pie is drawn as a circle.
+            ax.set_title('Product Distribution (PMS / AGO / Others)', fontsize=12, color=self.text_color)
+
+            # Save to bytes
+            img_buffer = io.BytesIO()
+            plt.savefig(img_buffer, format='PNG', dpi=self.dpi, bbox_inches='tight', facecolor='white')
+            img_buffer.seek(0)
+            chart_bytes = img_buffer.getvalue()
+
+            plt.close(fig)
+            img_buffer.close()
+
+            logger.info('Generated product distribution pie chart')
+            return chart_bytes
+
+        except Exception as e:
+            logger.error(f"Failed to generate product pie chart: {e}")
+            return None
+    
+    def extract_product_counts_from_df(self, df: pd.DataFrame) -> Dict[str, int]:
+        """Extract counts of product types (e.g., PMS, AGO) from a DataFrame's 'products' column."""
+        counts = {}
+        try:
+            if df is None or df.empty:
+                return counts
+
+            # Find candidate columns that might contain product names
+            product_cols = [c for c in df.columns if c.upper() in ('PRODUCTS', 'PRODUCT', 'PRODUCT_NAME')]
+            if not product_cols:
+                # Try heuristics: look for columns containing 'product' substring
+                product_cols = [c for c in df.columns if 'product' in c.lower()]
+
+            if not product_cols:
+                return counts
+
+            col = product_cols[0]
+            series = df[col].dropna().astype(str).str.strip()
+            for val in series:
+                key = val.upper()
+                # Normalize common names
+                if 'AGO' in key:
+                    label = 'AGO'
+                elif 'PMS' in key or 'PETROL' in key or 'GASOLINE' in key:
+                    label = 'PMS'
+                else:
+                    label = key
+                counts[label] = counts.get(label, 0) + 1
+        except Exception as e:
+            logger.error(f"Error extracting product counts: {e}")
+        return counts

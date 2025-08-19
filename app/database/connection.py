@@ -180,8 +180,7 @@ class SupabaseHandler:
         self.table_names = [
             'approved', 'bdc_cancel_order', 'bdc_decline', 'brv_checked',
             'depot_manager', 'good_standing', 'loaded', 'order_released',
-            'ordered', 'ppmc_cancel_order', 'depot_manager_decline', 'marked',
-            'depot_manager_new_records', 'approved_new_records'
+            'ordered', 'ppmc_cancel_order', 'depot_manager_decline', 'marked'
         ]
     
     async def make_request(self, method: str, endpoint: str, 
@@ -261,6 +260,36 @@ class SupabaseHandler:
             logger.error(f"Failed to search BRV number {brv_number}: {str(e)}")
             return []
 
+    async def search_bdc(self, bdc_query: str) -> List[Dict]:
+        """Search for records by BDC name (case-insensitive substring) across all tables.
+
+        Uses the Supabase REST `ilike` operator to perform case-insensitive matching.
+        Example param generated: {'bdc': 'ilike.%query%'}
+        """
+        try:
+            results = []
+            q = (bdc_query or '').strip()
+            if not q:
+                return results
+
+            # Build ilike filter value (Surrounded by % for substring match)
+            ilike_value = f'ilike.%{q}%'
+
+            for table_name in self.table_names:
+                params = {'bdc': ilike_value}
+                result, error = await self.make_request('GET', table_name, params=params)
+
+                if result and not error:
+                    for record in result:
+                        results.append({'table': table_name, 'data': record})
+                    logger.info(f"Found {len(result)} records in {table_name} matching BDC '{q}'")
+
+            logger.info(f"Found {len(results)} total records matching BDC '{q}'")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to search BDC '{bdc_query}': {str(e)}")
+            return []
+
     async def get_table_stats(self) -> Dict[str, int]:
         """Get record counts for all tables"""
         try:
@@ -335,6 +364,48 @@ class SupabaseHandler:
             logger.error(f"Failed to fetch recent records from {table_name}: {str(e)}")
             return pd.DataFrame()
 
+    async def get_new_records_since(self, table_name: str, last_checked_timestamp: datetime) -> pd.DataFrame:
+        """Fetch new records from a specified table since a given timestamp"""
+        try:
+            # Supabase uses ISO 8601 format for timestamps
+            timestamp_str = last_checked_timestamp.isoformat(timespec='milliseconds') + 'Z'
+            
+            params = {
+                'created_at': f'gte.{timestamp_str}',
+                'order': 'created_at.asc'
+            }
+            result, error = await self.make_request('GET', table_name, params=params)
+            
+            if error or not result:
+                logger.error(f"Failed to fetch new records from {table_name} since {timestamp_str}: {error}")
+                return pd.DataFrame()
+            
+            logger.info(f"Fetched {len(result)} new records from {table_name} since {timestamp_str}")
+            return pd.DataFrame(result)
+        except Exception as e:
+            logger.error(f"Failed to fetch new records from {table_name} since {last_checked_timestamp}: {str(e)}")
+            return pd.DataFrame()
+
+    async def get_all_records_for_pdf(self) -> pd.DataFrame:
+        """Fetch all records from all tables for PDF generation"""
+        try:
+            all_records = []
+            for table_name in self.table_names:
+                records, error = await self.get_records(table_name)
+                if not error and records:
+                    df = pd.DataFrame(records)
+                    df['status'] = table_name.replace('_', ' ').title()
+                    all_records.append(df)
+            
+            if not all_records:
+                return pd.DataFrame()
+
+            combined_df = pd.concat(all_records, ignore_index=True)
+            return combined_df
+        except Exception as e:
+            logger.error(f"Failed to fetch all records for PDF: {str(e)}")
+            return pd.DataFrame()
+
     async def insert_record(self, table: str, data: Dict) -> tuple[Optional[Dict], Optional[str]]:
         """Insert a record into a table"""
         return await self.make_request('POST', table, data=data)
@@ -347,6 +418,63 @@ class SupabaseHandler:
         """Delete a record from a table"""
         return await self.make_request('DELETE', f"{table}", params=filters)
     
+    async def get_product_counts(self, tables: Optional[List[str]] = None) -> Dict[str, int]:
+        """Fetch product values from the provided tables and return normalized counts.
+
+        This queries the supplied tables (defaults to ['marked','brv_checked','loaded','order_released'])
+        and attempts to read common product columns ('products', 'product', 'product_name'). Values are
+        normalized to 'PMS' and 'AGO' where possible; all other values are returned as-is (uppercased)
+        and contribute to the 'Others' bucket when plotted.
+        """
+        try:
+            tables_to_query = tables or ['marked', 'brv_checked', 'loaded', 'order_released']
+            counts: Dict[str, int] = {}
+
+            for table_name in tables_to_query:
+                try:
+                    # Try common product column names; request one column at a time to avoid schema mismatch
+                    result = None
+                    error = None
+
+                    for col in ('products', 'product', 'product_name'):
+                        params = {'select': col}
+                        res, err = await self.make_request('GET', table_name, params=params)
+                        if not err and res:
+                            result = res
+                            product_col = col
+                            break
+
+                    if not result:
+                        # No usable product column / no results for this table
+                        continue
+
+                    # Aggregate counts
+                    for row in result:
+                        raw_val = row.get(product_col)
+                        if raw_val is None:
+                            continue
+
+                        val = str(raw_val).strip().upper()
+                        if 'AGO' in val:
+                            label = 'AGO'
+                        elif 'PMS' in val or 'PETROL' in val or 'GASOLINE' in val:
+                            label = 'PMS'
+                        else:
+                            label = val
+
+                        counts[label] = counts.get(label, 0) + 1
+
+                except Exception as table_err:
+                    logger.warning(f"Failed to query products from {table_name}: {table_err}")
+                    continue
+
+            logger.info(f"Aggregated product counts from tables {tables_to_query}: {counts}")
+            return counts
+
+        except Exception as e:
+            logger.error(f"Failed to get product counts: {e}")
+            return {}
+
     async def close(self) -> None:
         """Close handler and cleanup connections"""
         await self.conn_manager.close_all()

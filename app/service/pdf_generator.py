@@ -38,6 +38,8 @@ class PDFGenerator:
         self.total_volume = SupabaseHandler()
         self.chart_generator = ChartGenerator()
         self._cached_total_volume = None  # Cache for sync methods
+        self._cached_product_counts = None  # Cache product counts fetched from DB
+        self._cached_product_chart_bytes = None  # Cache product pie chart bytes
     
     async def generate(self, df: pd.DataFrame, title: str, 
                       footnote: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str]]:
@@ -56,6 +58,28 @@ class PDFGenerator:
             except Exception as e:
                 logger.warning(f"Could not cache total volume: {e}")
                 self._cached_total_volume = None
+
+            # Pre-fetch product counts from database tables and generate product pie chart bytes in thread
+            try:
+                self._cached_product_counts = await self.total_volume.get_product_counts()
+                logger.debug(f"Cached product counts: {self._cached_product_counts}")
+            except Exception as e:
+                logger.warning(f"Could not fetch product counts: {e}")
+                self._cached_product_counts = None
+
+            if self._cached_product_counts:
+                # Generate pie chart bytes using matplotlib in a thread to avoid blocking
+                try:
+                    self._cached_product_chart_bytes = await asyncio.to_thread(
+                        self.chart_generator.generate_product_pie_chart_from_counts,
+                        self._cached_product_counts
+                    )
+                    logger.debug("Cached product pie chart bytes")
+                except Exception as e:
+                    logger.warning(f"Could not generate product pie chart: {e}")
+                    self._cached_product_chart_bytes = None
+            else:
+                self._cached_product_chart_bytes = None
             
             # Run PDF generation in thread pool to avoid blocking
             pdf_data = await asyncio.to_thread(self._generate_pdf_sync, df, title, footnote)
@@ -74,6 +98,9 @@ class PDFGenerator:
         pdf.set_auto_page_break(auto=True, margin=self.page_margin)
         pdf.add_page()
 
+        # Add summary statistics at the top
+        self._add_summary_section(pdf, df)
+
         # Add Title
         self._add_title(pdf, title)
 
@@ -91,6 +118,10 @@ class PDFGenerator:
             self._add_footnote(pdf, footnote)
         
         # Return PDF as bytes
+        return self._write_pdf_data(pdf)
+    
+    def _write_pdf_data(self, pdf: PDFType) -> bytes:
+        """Write PDF data to bytes"""
         pdf_output = pdf.output(dest='S')
         if isinstance(pdf_output, str):
             return pdf_output.encode('utf-8', errors='replace')
@@ -112,42 +143,103 @@ class PDFGenerator:
 
         for col, width in zip(columns, col_widths):
             col_text = self._truncate_text(str(col), 15)
-            pdf.cell(width, self.row_height, col_text, border=1, align='C', fill=True)
+            pdf.cell(width, self.row_height, col_text, border=0, align='C', fill=True)
         
         pdf.ln()
     
     def _add_data_rows(self, pdf, df: pd.DataFrame) -> None:
         """Add data rows with pagination support"""
-        col_widths = self._calculate_column_widths(pdf, df.columns)
+        main_columns = [
+            'order_date', 'order_number', 'products', 'volume',
+            'ex_ref_price', 'brv_number', 'bdc'
+        ]
+        
+        # Ensure only main columns are used and preserve original order
+        df_display = df[[col for col in main_columns if col in df.columns]]
+
         pdf.set_font(self.font, size=7)
 
         # Reset fill color for data rows
         pdf.set_fill_color(255, 255, 255)
 
-        row_count = 0
-        for _, row in df.iterrows():
-            # Check if we need a new page (leave space for summary)
-            if pdf.get_y() + self.row_height + 50 > pdf.h - self.page_margin:  # 50mm for summary space
-                pdf.add_page()
-                self._add_table_headers(pdf, df.columns)
-            
-            # Add alternating row colors for better readability
-            fill = row_count % 2 == 0
-            if fill:
-                pdf.set_fill_color(245, 245, 245)
-            else:
-                pdf.set_fill_color(255, 255, 255)
-            
-            # Add each cell in the row
-            for col, width in zip(df.columns, col_widths):
-                cell_value = row[col]
-                cell_text = self._format_cell_value(cell_value)
-                pdf.cell(width, self.row_height, cell_text, border=1, fill=fill)
-            
-            pdf.ln()
-            row_count += 1
+        # Group by status and add data for each status
+        # Ensure 'status' column exists before grouping
+        if 'status' in df.columns:
+            for status, group_df in df.groupby('status'):
+                # Add status as a new section title
+                pdf.ln(5) # Add some space
+                pdf.set_font(self.font, 'B', 10)
+                pdf.cell(0, self.row_height, f"Status: {status}", ln=True, align='L')
+                pdf.ln(2)
+                
+                # Add table headers for this group (without status column)
+                col_widths = self._calculate_column_widths(pdf, df_display.columns)
+                pdf.set_font(self.font, 'B', 8)
+                pdf.set_fill_color(220, 220, 220)  # light gray
+                for col, width in zip(df_display.columns, col_widths):
+                    col_text = self._truncate_text(str(col), 15)
+                    pdf.cell(width, self.row_height, col_text, border=0, align='C', fill=True)
+                pdf.ln()
+
+                # Add data rows for the current status group
+                row_count = 0
+                for _, row in group_df.iterrows():
+                    # Check if we need a new page (leave space for summary)
+                    if pdf.get_y() + self.row_height + 50 > pdf.h - self.page_margin:  # 50mm for summary space
+                        pdf.add_page()
+                        # Re-add status title and headers on new page
+                        pdf.ln(5)
+                        pdf.set_font(self.font, 'B', 10)
+                        pdf.cell(0, self.row_height, f"Status: {status}", ln=True, align='L')
+                        pdf.ln(2)
+                        pdf.set_font(self.font, 'B', 8)
+                        pdf.set_fill_color(220, 220, 220)  # light gray
+                        for col, width in zip(df_display.columns, col_widths):
+                            col_text = self._truncate_text(str(col), 15)
+                            pdf.cell(width, self.row_height, col_text, border=0, align='C', fill=True)
+                        pdf.ln()
+
+                    # Add alternating row colors for better readability
+                    fill = row_count % 2 == 0
+                    if fill:
+                        pdf.set_fill_color(245, 245, 245)
+                    else:
+                        pdf.set_fill_color(255, 255, 255)
+                    
+                    # Add each cell in the row
+                    pdf.set_font(self.font, size=7)
+                    for col, width in zip(df_display.columns, col_widths):
+                        cell_value = row[col]
+                        cell_text = self._format_cell_value(cell_value)
+                        pdf.cell(width, self.row_height, cell_text, border=0, fill=fill)
+                    
+                    pdf.ln()
+                    row_count += 1
+        else:
+            # If no 'status' column, just add all data rows without grouping
+            col_widths = self._calculate_column_widths(pdf, df_display.columns)
+            pdf.set_font(self.font, size=7)
+            row_count = 0
+            for _, row in df_display.iterrows():
+                if pdf.get_y() + self.row_height + 50 > pdf.h - self.page_margin:
+                    pdf.add_page()
+                    self._add_table_headers(pdf, df_display.columns)
+                
+                fill = row_count % 2 == 0
+                if fill:
+                    pdf.set_fill_color(245, 245, 245)
+                else:
+                    pdf.set_fill_color(255, 255, 255)
+                
+                for col, width in zip(df_display.columns, col_widths):
+                    cell_value = row[col]
+                    cell_text = self._format_cell_value(cell_value)
+                    pdf.cell(width, self.row_height, cell_text, border=0, fill=fill)
+                
+                pdf.ln()
+                row_count += 1
     
-    def _add_summary_to_bottom(self, pdf, df: pd.DataFrame) -> None:
+    def _add_summary_section(self, pdf, df: pd.DataFrame) -> None:
         """Add summary statistics and BDC volume chart to the bottom of the current page"""
         # Generate summary statistics using cached volume
         summary_data = self._generate_summary_stats_cached(df)
@@ -195,13 +287,20 @@ class PDFGenerator:
             
             pdf.ln()
         
-        # Add chart if available
+        # Add BDC chart if available
         if chart_bytes:
             try:
                 self._add_chart_to_pdf(pdf, chart_bytes, "BDC Volume Distribution")
             except Exception as e:
                 logger.warning(f"Could not add chart to PDF: {e}")
-    
+
+        # Add product distribution pie chart (from cached product chart bytes) if available
+        if getattr(self, '_cached_product_chart_bytes', None):
+            try:
+                self._add_chart_to_pdf(pdf, self._cached_product_chart_bytes, "Product Distribution (PMS / AGO / Others)")
+            except Exception as e:
+                logger.warning(f"Could not add product distribution chart to PDF: {e}")
+
     def _add_footnote(self, pdf, footnote: str) -> None:
         """Add footnote at the bottom of the PDF"""
         # Move to bottom of page
@@ -295,6 +394,12 @@ class PDFGenerator:
     
     async def _generate_summary_stats(self, df: pd.DataFrame) -> dict:
         """Generate summary statistics from DataFrame"""
+        main_columns = [
+            'order_date', 'order_number', 'products', 'volume',
+            'ex_ref_price', 'brv_number', 'bdc'
+        ]
+        df = df[[col for col in main_columns if col in df.columns]]
+
         stats = {
             'total_records': len(df),
             'date_range': 'N/A',
@@ -333,6 +438,12 @@ class PDFGenerator:
     
     def _generate_summary_stats_cached(self, df: pd.DataFrame) -> dict:
         """Generate summary statistics using cached volume data (synchronous)"""
+        main_columns = [
+            'order_date', 'order_number', 'products', 'volume',
+            'ex_ref_price', 'brv_number', 'bdc'
+        ]
+        df = df[[col for col in main_columns if col in df.columns]]
+
         stats = {
             'total_records': len(df),
             'date_range': 'N/A',
