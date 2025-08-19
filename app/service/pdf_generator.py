@@ -111,7 +111,7 @@ class PDFGenerator:
         self._add_data_rows(pdf, df)
 
         # Add summary statistics at the bottom
-        self._add_summary_to_bottom(pdf, df)
+        self._add_summary_section(pdf, df)
 
         # Add footnote if provided
         if footnote:
