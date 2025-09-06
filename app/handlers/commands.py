@@ -439,36 +439,37 @@ class CommandHandlers:
                 await update.message.reply_text("📄 Generating fresh PDF report...")
 
                 # First, try to get data from the database
-                processed_df = await self.db_handler.get_all_records_for_pdf()
+                processed_data_frames = await self.db_handler.get_all_records_for_pdf()
 
                 # If database is empty, fall back to API
-                if processed_df.empty:
+                if not processed_data_frames:
                     logger.info("Database is empty, falling back to API for PDF generation.")
                     await update.message.reply_text("ℹ️ Database is empty, falling back to API...")
                     fetch_result = await self.data_fetcher.fetch_data()
                     if fetch_result.error:
                         await update.message.reply_text(f"❌ Failed to fetch data from API: {fetch_result.error}")
                         return
-                    processed_df, error = await self.data_fetcher.process_data(fetch_result)
+                    single_df, error = await self.data_fetcher.process_data(fetch_result)
                     if error:
                         await update.message.reply_text(f"❌ Failed to process API data: {error}")
                         return
+                    if single_df is not None and not single_df.empty:
+                        processed_data_frames = {"API Data": single_df}
+                    else:
+                        processed_data_frames = {}
 
-                if processed_df is None or processed_df.empty:
+                if not processed_data_frames:
                     await update.message.reply_text("📭 No data found to generate PDF.")
                     return
 
-                # Select main columns for the PDF report
-                main_columns = [
-                    'order_date', 'order_number', 'products', 'volume',
-                    'ex_ref_price', 'brv_number', 'bdc'
-                ]
-                pdf_df = processed_df[[col for col in main_columns if col in processed_df.columns]]
-
                 title = f"BOST-KUMASI Report - {current_time.strftime('%d-%m-%Y %H:%M:%S')}"
-                footnote = "Data sourced from Database. Processed by I.T.S (Persol System Limited). Modified by Awuah."
+                footnote = (
+                    "Data sourced from I.T.S (Persol System Limited). "
+                    "Modified by Awuah. Data may be incorrect. "
+                    "For issues, contact: awuahbj@gmail.com"
+                )
 
-                pdf_data, error = await self.pdf_generator.generate(pdf_df, title, footnote)
+                pdf_data, error = await self.pdf_generator.generate(processed_data_frames, title, footnote)
                 if error:
                     await update.message.reply_text(f"❌ Failed to generate PDF: {error}")
                     return
@@ -483,7 +484,7 @@ class CommandHandlers:
                     await update.message.reply_document(
                         document=pdf_file,
                         filename=filename,
-                        caption=f"📄 Latest Report ({len(processed_df)} records) ✨ Fresh"
+                        caption=f"📄 Latest Report ({sum(len(df) for df in processed_data_frames.values())} records) ✨ Fresh"
                     )
 
         except asyncio.TimeoutError:

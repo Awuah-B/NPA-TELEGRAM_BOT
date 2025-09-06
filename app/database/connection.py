@@ -386,25 +386,21 @@ class SupabaseHandler:
             logger.error(f"Failed to fetch new records from {table_name} since {last_checked_timestamp}: {str(e)}")
             return pd.DataFrame()
 
-    async def get_all_records_for_pdf(self) -> pd.DataFrame:
-        """Fetch all records from all tables for PDF generation"""
+    async def get_all_records_for_pdf(self) -> dict[str, pd.DataFrame]:
+        """Fetch all records from all tables for PDF generation, returned as a dictionary of DataFrames"""
         try:
-            all_records = []
+            all_data_frames = {}
             for table_name in self.table_names:
                 records, error = await self.get_records(table_name)
                 if not error and records:
                     df = pd.DataFrame(records)
-                    df['status'] = table_name.replace('_', ' ').title()
-                    all_records.append(df)
+                    # No need to add 'status' column here, as the table_name will be the key
+                    all_data_frames[table_name.replace('_', ' ').title()] = df # Use title-cased table name as key
             
-            if not all_records:
-                return pd.DataFrame()
-
-            combined_df = pd.concat(all_records, ignore_index=True)
-            return combined_df
+            return all_data_frames
         except Exception as e:
             logger.error(f"Failed to fetch all records for PDF: {str(e)}")
-            return pd.DataFrame()
+            return {}
 
     async def insert_record(self, table: str, data: Dict) -> tuple[Optional[Dict], Optional[str]]:
         """Insert a record into a table"""

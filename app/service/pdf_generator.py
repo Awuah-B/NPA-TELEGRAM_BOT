@@ -8,6 +8,7 @@ Handles PDF creation from DataFrame data with proper formatting.
 import asyncio
 from typing import List, Tuple, Optional
 import pandas as pd
+from datetime import datetime, timedelta
 
 from app.utils.log_settings import setup_logging
 from app.database.connection import SupabaseHandler
@@ -109,7 +110,7 @@ class PDFGenerator:
         
 
         # Add table headers
-        self._add_table_headers(pdf, all_data_df.columns)
+        #self._add_table_headers(pdf, all_data_df.columns)
 
         # Add data rows
         self._add_data_rows_from_dict(pdf, data_frames)
@@ -233,7 +234,7 @@ class PDFGenerator:
             # Add status as a new section title
             pdf.ln(5) # Add some space
             pdf.set_font(self.font, 'B', 10)
-            pdf.cell(0, self.row_height, f"Status: {status}", ln=True, align='L')
+            pdf.cell(0, self.row_height,  status, ln=True, align='L')
             pdf.ln(2)
 
             # Ensure only main columns are used and preserve original order
@@ -257,7 +258,7 @@ class PDFGenerator:
                     # Re-add status title and headers on new page
                     pdf.ln(5)
                     pdf.set_font(self.font, 'B', 10)
-                    pdf.cell(0, self.row_height, f"Status: {status}", ln=True, align='L')
+                    pdf.cell(0, self.row_height,  status, ln=True, align='L')
                     pdf.ln(2)
                     pdf.set_font(self.font, 'B', 8)
                     pdf.set_fill_color(220, 220, 220)  # light gray
@@ -432,7 +433,7 @@ class PDFGenerator:
         stats = {
             'total_records': len(df),
             'depot': 'BOST-KUMASI',
-            'date_range': f"{yesterday.strftime('%d-%m-%Y')} to {today.strftime('%d-%m-%Y')}',
+            'date_range': f"{yesterday.strftime('%d-%m-%Y')} to {today.strftime('%d-%m-%Y')}",
             'total_volume_loaded': 'N/A'
         }
 
