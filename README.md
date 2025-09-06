@@ -55,6 +55,7 @@ The bot is built with a modular architecture:
    ```bash
    cp .env.example .env
    # Edit .env with your actual configuration values
+   # Make sure to add your GEMINI_API_KEY
    ```
 
 5. **Configure group subscriptions**:
@@ -101,7 +102,16 @@ Required table structure includes:
 python main.py
 ```
 
-### Available Commands
+### Getting Started with AI Features
+
+1. **Get Gemini API Key**: Visit [Google AI Studio](https://makersuite.google.com/app/apikey) to get your API key
+2. **Configure Environment**: Add `GEMINI_API_KEY` to your `.env` file
+3. **Test AI Features**: 
+   - Send text messages like "show me the help"
+   - Send voice messages with spoken commands
+   - Upload audio files for processing
+
+### Command Usage
 
 - `/start` - Initialize the bot and get welcome message
 - `/help` - Display help information
