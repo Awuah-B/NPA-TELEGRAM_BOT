@@ -6,6 +6,8 @@ A Telegram bot for monitoring the Ghana National Petroleum Authority (NPA) data 
 
 - **Real-time Monitoring**: Monitors multiple data tables for new records using Supabase realtime subscriptions
 - **Telegram Bot Interface**: Interactive commands for data access and monitoring
+- **AI-Powered Processing**: Natural language and speech message processing using Google Gemini AI
+- **Multimodal Input**: Supports text, voice, and audio messages for command execution
 - **PDF Generation**: Creates detailed reports with data visualizations
 - **Group Management**: Supports multiple Telegram groups with admin controls
 - **Caching System**: Intelligent caching for improved performance
@@ -19,13 +21,14 @@ The bot is built with a modular architecture:
 - **Bot Core** (`app/bot.py`): Main bot orchestration and lifecycle management
 - **Database Layer** (`app/database/`): Supabase integration with caching and realtime subscriptions
 - **Handlers** (`app/handlers/`): Command and event handlers for Telegram interactions
-- **Services** (`app/service/`): Business logic for notifications, PDF generation, and data fetching
+- **Services** (`app/service/`): Business logic for notifications, PDF generation, data fetching, and AI processing
 - **Utils** (`app/utils/`): Logging, decorators, and helper functions
 
 ## Prerequisites
 
 - Python 3.12+
 - Telegram Bot Token (from [@BotFather](https://t.me/botfather))
+- Google Gemini API Key (from [Google AI Studio](https://makersuite.google.com/app/apikey))
 - Supabase Project with appropriate tables
 - Google Cloud account (for deployment)
 
@@ -68,6 +71,7 @@ The bot is built with a modular architecture:
 |----------|-------------|----------|
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | Yes |
 | `TELEGRAM_SUPERADMIN_IDS` | Comma-separated list of admin user IDs | Yes |
+| `GEMINI_API_KEY` | Google Gemini API key for AI processing | Yes |
 | `SUPABASE_URL` | Your Supabase project URL | Yes |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key | Yes |
 | `SUPABASE_ANON_KEY` | Supabase anonymous key | Yes |
@@ -112,6 +116,24 @@ python main.py
 - `/groups` - List subscribed groups (superadmin only)
 - `/cache_status` - Show cache statistics
 - `/clear_cache` - Clear cache (admin only)
+
+### AI-Powered Features
+
+The bot now supports natural language and speech processing:
+
+**Text Messages:**
+- Send natural language messages like "show me the help" or "check status"
+- The bot uses Google Gemini AI to understand your intent and execute commands
+
+**Voice/Audio Messages:**
+- Send voice messages or audio files with spoken commands
+- The bot transcribes your speech and executes the appropriate command
+- Supports various audio formats (OGG, MP3, WAV)
+
+**Examples:**
+- Voice: *"Show me recent records"* → Executes `/recent`
+- Text: *"What's the current status?"* → Executes `/status`
+- Audio: *"Generate a PDF report"* → Executes `/download_pdf`
 
 ### Group Management
 
@@ -162,6 +184,13 @@ Logs are organized by component:
 
 ## API Integration
 
+### Google Gemini AI
+The bot integrates with Google Gemini AI for natural language and speech processing:
+- **Text Processing**: Understands natural language commands and intents
+- **Speech Recognition**: Transcribes audio messages and extracts commands
+- **Multimodal Support**: Handles both text and audio inputs seamlessly
+- **Fallback Models**: Automatic fallback to available Gemini models
+
 ### NPA API
 The bot integrates with the NPA Enterprise API for fetching petroleum data:
 - Daily order reports
@@ -207,6 +236,14 @@ For support and questions:
 - Contact the development team
 
 ## Changelog
+
+### Version 1.1.0 (Latest)
+- **AI Integration**: Added Google Gemini AI for natural language processing
+- **Speech Recognition**: Support for voice and audio message processing
+- **Multimodal Input**: Bot now accepts text, voice, and audio commands
+- **Enhanced User Experience**: Natural language command understanding
+- **Improved Error Handling**: Better fallback mechanisms for AI processing
+- **Model Fallback**: Automatic fallback to available Gemini models
 
 ### Version 1.0.0
 - Initial release with core monitoring functionality

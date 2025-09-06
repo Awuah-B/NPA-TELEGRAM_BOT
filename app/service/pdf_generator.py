@@ -214,7 +214,7 @@ class PDFGenerator:
         # Add product distribution pie chart (from cached product chart bytes) if available
         if getattr(self, '_cached_product_chart_bytes', None):
             try:
-                self._add_chart_to_pdf(pdf, self._cached_product_chart_bytes, "Product Distribution (PMS / AGO / Others)")
+                self._add_chart_to_pdf(pdf, self._cached_product_chart_bytes, "Product Loaded Distribution (PMS / AGO / Others)")
             except Exception as e:
                 logger.warning(f"Could not add product distribution chart to PDF: {e}")
 

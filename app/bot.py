@@ -10,11 +10,12 @@ from datetime import datetime
 from typing import Optional, Dict, List
 from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
 from telegram import Bot, Update, ChatMember
-from telegram.ext import Application, CommandHandler, ChatMemberHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ChatMemberHandler, ContextTypes
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 import re
+import pandas as pd
 
 from app.config import CONFIG
 from app.database.connection import SupabaseHandler
@@ -160,6 +161,11 @@ class NPAMonitorBot:
         self.application.add_handler(
             ChatMemberHandler(self.event_handlers.track_chat_members, ChatMemberHandler.MY_CHAT_MEMBER)
         )
+        # Add message handler for general text and audio messages
+        self.application.add_handler(MessageHandler(
+            (filters.TEXT & ~filters.COMMAND) | filters.VOICE | filters.AUDIO, 
+            self.command_handlers.handle_general_message
+        ))
         logger.info(f"🔧 Registered {len(handlers) + 1} handlers to application")
         logger.info(f"🔧 Application handlers count: {len(self.application.handlers.get(0, []))}")
     

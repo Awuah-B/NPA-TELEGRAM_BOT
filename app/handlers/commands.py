@@ -19,6 +19,7 @@ from telegram.constants import ChatType, ParseMode
 from app.config import CONFIG
 from app.service.data_fetcher import DataFetcher
 from app.service.pdf_generator import PDFGenerator
+from app.service.gemini_processor import GeminiProcessor
 from app.database.connection import SupabaseHandler
 from app.utils.decorators import rate_limit, admin_required, subscribed_group_required
 from app.utils.helper import split_message, validate_brv_format
@@ -100,6 +101,15 @@ class CommandHandlers:
         self.pdf_generator = PDFGenerator()
         self.db_handler = SupabaseHandler()  # Single instance for all operations
         self.pdf_cache = PDFCache(ttl_minutes=30)  # 30-minute cache for PDFs
+        
+        # Initialize Gemini processor with error handling
+        try:
+            self.gemini_processor = GeminiProcessor()
+            self.available_commands = self._get_available_commands()
+        except Exception as e:
+            logger.warning(f"Failed to initialize Gemini processor: {e}")
+            self.gemini_processor = None
+            self.available_commands = []
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -466,7 +476,6 @@ class CommandHandlers:
                 footnote = (
                     "Data sourced from I.T.S (Persol System Limited). "
                     "Modified by Awuah. Data may be incorrect. "
-                    "For issues, contact: awuahbj@gmail.com"
                 )
 
                 pdf_data, error = await self.pdf_generator.generate(processed_data_frames, title, footnote)
@@ -525,79 +534,91 @@ class CommandHandlers:
             logger.error(f"Groups command failed: {e}")
             await update.message.reply_text("❌ Failed to retrieve group information.")
     
-    def _get_group_welcome_message(self) -> str:
-        return """
-🏭 **Hello! I'm Bost Lady**
+    def _get_available_commands(self) -> List[str]:
+        """Returns a list of available command strings."""
+        commands = [
+            "/start", "/help", "/status", "/subscribe", "/unsubscribe",
+            "/check", "/recent", "/stats", "/cache_status", "/clear_cache",
+            "/volume", "/download_pdf", "/groups", "/search_bdc"
+        ]
+        return commands
 
-I monitor the NPA system for updates and provide real-time notifications.
+    async def handle_general_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles general text and audio messages using Gemini to determine intent."""
+        message = update.message
+        
+        # Handle text messages
+        if message.text and not message.text.startswith('/'):
+            user_message = message.text
+            
+            # Check if Gemini processor is available
+            if not self.gemini_processor:
+                await update.message.reply_text("🤖 AI processing is currently unavailable. Please use direct commands like /help.", parse_mode=ParseMode.MARKDOWN)
+                return
 
-**Group Commands:**
-• `/help` - Show all commands
-• `/status` - Check bot status
-• `/subscribe` - Subscribe group to notifications (admin only)
-• `/unsubscribe` - Unsubscribe group (admin only)
-• `/check <BRV>` - Search for specific BRV number
-• `/search_bdc <name>` - Search for records by BDC name
-• `/recent` - Show recent records
-• `/stats` - Show statistics
-• `/download_pdf` - Download latest report (subscribed groups only)
+            command_to_execute = self.gemini_processor.get_command_from_text(user_message, self.available_commands)
 
-**Admin Note:** Only group administrators can subscribe/unsubscribe the group.
-        """
-
-    def _get_private_welcome_message(self) -> str:
-        return """
-🏭 **Welcome to NPA Monitor Bot!**
-
-This bot is designed to work in group chats to monitor NPA Depot Manager records.
-
-Please add me to a group chat and use the commands there.
-
-**Available Commands:**
-• `/help` - Show help message
-• `/status` - Check bot status
-• `/groups` - List subscribed groups (superadmin only)
-• `/cache_status` - Show cache status (superadmin only)
-• `/clear_cache` - Clear all caches (superadmin only)
-        """
-    
-    def _get_group_help_message(self) -> str:
-        return """
-🤖 **Group Bot Commands**
-
-**Monitoring Commands:**
-• `/status` - Check if monitoring is active
-• `/check <BRV>` - Search for a specific BRV number
-• `/search_bdc <name>` - Search for records by BDC name
-• `/recent` - Show last 10 records
-• `/stats` - Show monitoring statistics
-• `/subscribe` - Subscribe group to notifications (admin only)
-• `/unsubscribe` - Unsubscribe group (admin only)
-• `/download_pdf` - Download latest report (subscribed groups only)
-• `/help` - Show this help message
-
-**Usage Examples:**
-• `/check AS496820` - Search for BRV number AS496820
-• `/search_bdc Reston` - Search for records from Reston BDC
-• `/recent` - Show recent records
-
-**Note:** Some commands require admin privileges or group subscription.
-        """
-    
-    def _get_private_help_message(self) -> str:
-        return """
-🤖 **Bot Commands (Private Chat)**
-
-• `/help` - Show this help
-• `/status` - Check bot status
-• `/recent` - Show recent records
-• `/stats` - Show statistics
-• `/groups` - List subscribed groups (superadmin only)
-• `/cache_status` - Show cache status (superadmin only)
-• `/clear_cache` - Clear all caches (superadmin only)
-
-**Note:** Most functionality is available in group chats. Please add the bot to a group for full features.
-        """
+            if command_to_execute != 'NO_COMMAND':
+                command_handler_name = command_to_execute.strip('/').split(' ')[0] + "_command"
+                handler = getattr(self, command_handler_name, None)
+                if handler and callable(handler):
+                    # Extract potential arguments from the user message
+                    context.args = user_message.split()[1:] if len(user_message.split()) > 1 else []
+                    await handler(update, context)
+            else:
+                await update.message.reply_text("I'm not sure how to respond to that. Try /help for a list of commands.", parse_mode=ParseMode.MARKDOWN)
+        
+        # Handle audio/voice messages
+        elif message.voice or message.audio:
+            await update.message.reply_text("🎵 Processing your audio message...")
+            
+            # Check if Gemini processor is available
+            if not self.gemini_processor:
+                await update.message.reply_text("🤖 AI processing is currently unavailable. Please use direct commands like /help.", parse_mode=ParseMode.MARKDOWN)
+                return
+            
+            try:
+                # Download the audio file
+                if message.voice:
+                    file = await message.voice.get_file()
+                else:
+                    file = await message.audio.get_file()
+                
+                # Create a temporary file path
+                import tempfile
+                import os
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.ogg') as temp_file:
+                    temp_path = temp_file.name
+                    await file.download_to_drive(temp_path)
+                
+                try:
+                    # Process the audio with Gemini
+                    command_to_execute = self.gemini_processor.process_audio_message(temp_path, self.available_commands)
+                    
+                    if command_to_execute != 'NO_COMMAND':
+                        command_handler_name = command_to_execute.strip('/').split(' ')[0] + "_command"
+                        handler = getattr(self, command_handler_name, None)
+                        if handler and callable(handler):
+                            # For audio commands, we don't have text args, so pass empty
+                            context.args = []
+                            await handler(update, context)
+                        else:
+                            await update.message.reply_text(f"🎵 I heard you want to execute: {command_to_execute}")
+                    else:
+                        await update.message.reply_text("🎵 I processed your audio but couldn't determine a specific command. Try speaking clearly or use text commands.", parse_mode=ParseMode.MARKDOWN)
+                
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                        
+            except Exception as e:
+                logger.error(f"Error processing audio message: {e}")
+                await update.message.reply_text("❌ Sorry, I couldn't process your audio message. Please try again or use text commands.", parse_mode=ParseMode.MARKDOWN)
+        
+        # Ignore other message types or commands
+        return
     
     async def _test_database_connection(self) -> bool:
         """Test database connection"""

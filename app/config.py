@@ -52,6 +52,11 @@ class APIConfig:
     user_id: str
     app_id: str
 
+@dataclass
+class GeminiConfig:
+    """Gemini API configuration"""
+    api_key: str
+
 @dataclass(frozen=True)
 class MonitoringConfig:
     interval_seconds: int = int(os.getenv('MONITORING_INTERVAL_SECONDS', '120'))  # Match data pipeline
@@ -109,6 +114,10 @@ class Config:
                 period_id=os.getenv('NPA_PERIOD_ID', '1'),
                 user_id=self._get_required_env('NPA_USER_ID'),
                 app_id=self._get_required_env('NPA_APP_ID')
+            )
+            
+            self.gemini = GeminiConfig(
+                api_key=self._get_required_env('GEMINI_API_KEY')
             )
             
             self.monitoring = MonitoringConfig(
